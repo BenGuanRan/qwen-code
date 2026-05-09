@@ -238,11 +238,15 @@ describe('useGeminiStream', () => {
       getCronScheduler: vi.fn(() => null),
       getEmitToolUseSummaries: vi.fn(() => false),
       getFastModel: vi.fn(() => undefined),
-      getBackgroundTaskRegistry: vi.fn(() => ({
-        setNotificationCallback: vi.fn(),
-      })),
-      getMonitorRegistry: vi.fn(() => ({
-        setNotificationCallback: vi.fn(),
+      getTaskRegistry: vi.fn(() => ({
+        getAll: () => [],
+        getByKind: () => [],
+        get: () => undefined,
+        register: () => undefined,
+        update: () => undefined,
+        evict: () => undefined,
+        kill: () => undefined,
+        subscribe: () => () => {},
       })),
     } as unknown as Config;
     mockOnDebugMessage = vi.fn();
