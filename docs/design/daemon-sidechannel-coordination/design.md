@@ -1,6 +1,6 @@
 # Daemon side-channel coordination — Design (A1 / A2 / A4 / A5)
 
-> Targets `daemon_mode_b_main` (per #4175 branching strategy). Author: 秦奇. Date: 2026-05-25. Revised: 2026-05-26 (v5 — fourth review round).
+> Targets `daemon_mode_b_main` (per #4175 branching strategy). Author: 秦奇. Date: 2026-05-25. Revised: 2026-05-26 (v7 — A1 transport correction).
 > **Docs-only / design-first.** Implementation PRs follow design-review approval. A4 already implemented + approved (PR #4539).
 >
 > Source: cross-client real-time sync audit (2026-05-24) + PR #4484 post-merge review (the **A-series** follow-ups). The bugfix/cleanup follow-ups from the same review ship separately (PR #4510) and are **out of scope here**.
