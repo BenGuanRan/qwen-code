@@ -1,9 +1,20 @@
 # Daemon side-channel coordination — Design (A1 / A2 / A4 / A5)
 
-> Targets `daemon_mode_b_main` (per #4175 branching strategy). Author: 秦奇. Date: 2026-05-25.
+> Targets `daemon_mode_b_main` (per #4175 branching strategy). Author: 秦奇. Date: 2026-05-25. Revised: 2026-05-26 (v2 — review fold-ins).
 > **Docs-only / design-first.** Implementation PRs follow design-review approval.
 >
-> Source: cross-client real-time sync audit (2026-05-24) + PR #4484 post-merge review (the **A-series** follow-ups). The bugfix/cleanup follow-ups from the same review (D1 epoch-reset, A3 approval-mode serialization, D2/C3/D4, Provider catch-up) ship separately as the implementation PR for that batch and are **out of scope here**.
+> Source: cross-client real-time sync audit (2026-05-24) + PR #4484 post-merge review (the **A-series** follow-ups). The bugfix/cleanup follow-ups from the same review (D1 epoch-reset, A3 approval-mode serialization, D2/C3/D4, Provider catch-up) ship separately (PR #4510) and are **out of scope here**.
+
+## Changelog
+
+### v2 (2026-05-26) — review fold-ins (wenshao 4×Critical + 2×Suggestion, doudouOUC, Copilot 3×)
+
+- **A1/A2 are NOT symmetric** — verified the two HTTP paths route differently into the agent. A1's `POST /model` goes through `Session.setModel`; A2's `POST /approval-mode` uses a separate extMethod that calls `config.setApprovalMode` directly, bypassing `Session.setMode`. The "single-emitter convergence" can't be applied uniformly. §3 rewritten; §6 split; §9 OQ1 **resolved** with a decision table (was an internal contradiction).
+- **Demux contract added (§2.1)** — the bridge publishes every `sessionUpdate` notification as a generic `session_update` bus event; there is no sub-type demux today. A1's "map to `model_switched`" requires a new demux layer, with explicit rules for promotion + generic-wrapper suppression. `current_mode_update` already flows through this path generically.
+- **A5 `pendingPermissionIds` removed** from the snapshot — it created an authorization gap (a freshly-attached client could vote on a request it never saw the context for). Snapshot now carries only mode/model/commands.
+- **Anchor hygiene** — all anchors now use full `packages/...` paths. Note: `packages/acp-bridge/src/bridge.ts` (3923 LOC) and `permissionMediator.ts` (1291 LOC) are the **real** implementations (confirmed by doudouOUC); `packages/cli/src/serve/httpAcpBridge.ts` is a 101-line re-export shim — do not anchor against it.
+- `current_mode_update` correctly noted as wired to **two** callers (exit_plan_mode + edit-tool `ProceedAlways`), not one.
+- `voterClientId` specified **optional** (no-voter resolutions omit it); unknown-event compat note corrected (SDK surfaces them as `debug`, not silent).
 
 ---
 
@@ -11,14 +22,16 @@
 
 In scope — four side-channel state-coordination gaps where a session-state change made on one path is invisible to other attached clients (or to peer sessions):
 
-| #      | One-liner                                                                                                                                                                                   |
-| ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **A1** | In-session model switch (`/model`, plan-mode) never reaches the bus.                                                                                                                        |
-| **A2** | In-session approval-mode change (`setMode`) emits no event; workspace visibility vs persist semantics unclear.                                                                              |
-| **A4** | `permission_resolved.originatorClientId` carries the _voter_, while `permission_request.originatorClientId` carries the _prompt originator_ — ambiguous, consumers must special-case.       |
-| **A5** | A client attaching via `Last-Event-ID` gets ring replay + live tail but no snapshot of current model / approval-mode / available-commands / pending-permissions; it must issue extra pulls. |
+| #      | One-liner                                                                                                                                                             |
+| ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **A1** | In-session model switch (`/model`, plan-mode) never reaches the bus.                                                                                                  |
+| **A2** | In-session approval-mode change (`setMode`) emits no event; the HTTP path uses a different agent entry point; workspace-vs-persist visibility unclear.                |
+| **A4** | `permission_resolved.originatorClientId` carries the _voter_, while `permission_request.originatorClientId` carries the _prompt originator_ — ambiguous.              |
+| **A5** | A client attaching via `Last-Event-ID` gets ring replay + live tail but no snapshot of current model / approval-mode / available-commands; it must issue extra pulls. |
 
-Non-goals: multimodal user-content echo (PR #4353 §D), the A3 race fix (separate PR), clientId anti-forgery (A6 — separate security track), the streamable-HTTP transport (#4472).
+Non-goals: multimodal user-content echo (PR #4353 §D), the A3 race fix (PR #4510), clientId anti-forgery (A6 — separate security track), the streamable-HTTP transport (#4472).
+
+**Anchor convention:** all file references use full repo-root paths. The bridge lives at `packages/acp-bridge/src/bridge.ts`; the agent at `packages/cli/src/acp-integration/acpAgent.ts`; the session at `packages/cli/src/acp-integration/session/Session.ts`.
 
 ---
 
@@ -33,7 +46,7 @@ in-session  → Session.setModel / setMode (slash command, plan-mode, agent)    
 
 The invariant we want: **every model / approval-mode / permission state transition produces exactly one bus broadcast regardless of which path initiated it**, and **a freshly attached client can reconstruct current side-channel state without out-of-band pulls**.
 
-The agent already has the right primitive for the in-session direction: ACP `sessionUpdate` notifications. `current_mode_update` exists today (`Session.ts:1646`) but is wired only to the `exit_plan_mode` path (`Session.ts:2155`), not to the generic `setMode` / `setModel` entry points.
+The agent already has a primitive for the in-session direction: ACP `sessionUpdate` notifications. `current_mode_update` exists today (`Session.ts:1645`, helper `sendCurrentModeUpdateNotification` at `Session.ts:1625`) but is wired only to **agent-tool confirmation paths** — `exit_plan_mode` (`Session.ts:2160`) and the edit-tool `ProceedAlways` path (`Session.ts:2168`). It is **not** wired to the generic `Session.setMode` / `Session.setModel` entry points, and there is no `current_model_update` type at all.
 
 ---
 
@@ -41,57 +54,71 @@ The agent already has the right primitive for the in-session direction: ACP `ses
 
 ### Problem
 
-`Session.setModel` (`Session.ts:1580`) calls `config.switchModel()` (`:1601`) and returns — it emits no `sessionUpdate`. Only the HTTP path `bridge.setSessionModel` (`bridge.ts:2798`) publishes `model_switched`. So a `/model` slash command, a plan-mode-driven switch, or any agent-internal model change is **invisible to peer clients** — their model badge silently drifts. There is no `current_model_update` sessionUpdate type at all today.
+`Session.setModel` (`packages/cli/src/acp-integration/session/Session.ts:1580`) calls `config.switchModel()` (`:1601`) and returns — it emits no `sessionUpdate`. Only the bridge's HTTP path publishes `model_switched` (`packages/acp-bridge/src/bridge.ts:2883`; also `:1172` for the `applyModelServiceId` path). So a `/model` slash command, a plan-mode-driven switch, or any agent-internal model change is **invisible to peer clients** — their model badge silently drifts. There is no `current_model_update` sessionUpdate type today.
 
 ### Proposed design
 
-1. Add an ACP `current_model_update` sessionUpdate (mirrors `current_mode_update`): `{ sessionUpdate: 'current_model_update', currentModelId: string, authType?: string }`.
-2. Emit it from `Session.setModel` after `switchModel` resolves (one helper `sendCurrentModelUpdateNotification`, symmetric to `sendCurrentModeUpdateNotification`).
-3. The bridge maps an inbound `current_model_update` sessionUpdate to the **existing** `model_switched` bus event and fans it out (with `originatorClientId` from the active prompt's originator when known).
-4. **Converge to one source of truth.** The HTTP `setSessionModel` path's `unstable_setSessionModel` already runs inside the agent, which (after this change) emits `current_model_update`. So the bridge should publish `model_switched` from the **notification path only** and stop the separate post-roundtrip publish in `setSessionModel` — otherwise an HTTP switch double-broadcasts (once from the route, once from the agent notification). This is the central design decision: the agent becomes the single emitter; the HTTP route just drives the agent and lets the notification carry the broadcast.
+1. Add an ACP `current_model_update` sessionUpdate (mirrors `current_mode_update`): `{ sessionUpdate: 'current_model_update', currentModelId: string, previousModelId?: string, authType? }`.
+2. Emit it from `Session.setModel` after `switchModel` resolves (a `sendCurrentModelUpdateNotification` helper, symmetric to `sendCurrentModeUpdateNotification`).
+3. The bridge **demuxes** the inbound `current_model_update` sub-type and re-publishes it as the existing `model_switched` bus event (see §2.1 for the demux contract), stamping `originatorClientId` from the active prompt's originator when known.
+4. **Single-emitter (A1 only — safe here).** Verified: the HTTP `POST /session/:id/model` path drives `unstable_setSessionModel` (`acpAgent.ts:925`) → `session.setModel` (`acpAgent.ts:935`). So **both** the in-session and HTTP paths flow through `Session.setModel`. Emitting from there covers both; the bridge's separate post-roundtrip `model_switched` publish in `setSessionModel` is then removed to avoid a double-broadcast. (This is **not** transferable to A2 — see §3.)
 
-### Alternatives
+### 2.1 Demux contract (prerequisite for A1 and A2)
 
-- **agent→bridge side-channel callback** (extNotification) instead of a sessionUpdate. Rejected: `current_mode_update` already establishes the sessionUpdate pattern; reusing it keeps the two control axes (mode, model) symmetric and avoids a second mechanism.
+Today the bridge's `sessionUpdate` handler publishes **every** notification verbatim as a generic `session_update` bus event (`packages/acp-bridge/src/bridge.ts:352`); it does **not** demux by `sessionUpdate` sub-type into named events. Promoting `current_model_update` / `current_mode_update` to `model_switched` / `approval_mode_changed` therefore requires a new demux layer with an explicit contract:
+
+- **Promotion table.** A fixed map of `sessionUpdate` sub-type → named bus event: `current_model_update → model_switched`, `current_mode_update → approval_mode_changed`.
+- **Generic-wrapper suppression.** For a promoted sub-type, the bridge publishes the named event **only** — it does **not** also publish the generic `session_update`. Otherwise consumers see both (double event).
+- **Compat call-out.** `current_mode_update` **already** flows through this handler today (from the tool-confirmation paths) and currently reaches SDK consumers as a generic `session_update`. Promoting it changes the event type existing listeners observe — this is a deliberate, documented behavior change, not silent. SDK normalizer + reducer must be updated in lockstep.
+- **Unknown sub-types.** Continue to pass through as generic `session_update` (default, unchanged).
 
 ### Wire / compat
 
-Additive sessionUpdate; pre-rename SDKs ignore unknown `sessionUpdate` values. SDK consumers continue to see the existing `model_switched` bus event — **no SDK change required** for basic correctness. (Optional: SDK could surface `authType` if present.)
+Additive sessionUpdate; pre-rename agents simply never send it. SDK consumers see the existing `model_switched` event — but note the demux compat call-out above for `current_mode_update`.
 
 ### Risk
 
-Double-broadcast on the HTTP path (mitigated by item 4 — pick the agent as the single emitter and remove the route-side publish). Needs a test that an HTTP `POST /session/:id/model` yields exactly one `model_switched`.
+Double-broadcast on the HTTP path (mitigated by item 4 + the §2.1 suppression rule). Test: an HTTP `POST /session/:id/model` yields exactly one `model_switched`, and the generic `session_update` is suppressed for the promoted sub-type.
 
 ---
 
-## 3. A2 — in-session approval-mode change + workspace-visibility semantics
+## 3. A2 — in-session approval-mode change (asymmetric to A1)
 
 ### Problem
 
-Two distinct issues:
+Two issues, and a structural asymmetry that breaks the A1 recipe:
 
-1. **Silent in-session change.** `Session.setMode` (`Session.ts:1561`) calls `config.setApprovalMode()` (`:1573`) and returns — unlike the exit_plan_mode path it does **not** call `sendCurrentModeUpdateNotification`. So an in-session approval-mode change (e.g. an `/approval-mode` slash command) reaches neither peer clients of the same session nor the bridge. Symmetric to A1.
-2. **Workspace visibility vs persist.** `bridge.setSessionApprovalMode` workspace-broadcasts only when `persist=true`; a non-persisted change publishes only on the originating session's own bus. Whether peer _sessions_ in the same workspace should see a non-persisted change is currently undefined-by-omission.
+1. **Silent in-session change.** `Session.setMode` (`Session.ts:1561`) calls `config.setApprovalMode()` (`:1573`) and returns — it does **not** call `sendCurrentModeUpdateNotification`. So an in-session approval-mode change reaches neither peer clients of the same session nor the bridge.
+2. **The HTTP path bypasses `Session.setMode`.** Unlike A1, the bridge's `setSessionApprovalMode` drives a **separate extMethod** `qwen/control/session/approval_mode` (`acpAgent.ts:2200`) which calls `config.setApprovalMode()` **directly** (`acpAgent.ts:2228`) — it does **not** go through `Session.setMode`. Therefore "emit from `Session.setMode` + remove the bridge publish" (the A1 recipe) would leave **HTTP-initiated approval changes emitting nothing at all** — a regression.
+3. **Workspace-vs-persist.** The bridge workspace-broadcasts only when `persist=true` (`bridge.ts:3007`); the session-scoped publish (`bridge.ts:2979`) fires unconditionally. `persist` is a bridge-level concept the agent has no knowledge of.
 
 ### Proposed design
 
-1. **Fix the in-session gap (the real bug):** emit `current_mode_update` from `Session.setMode`, so the change flows to the bridge and gets published as `approval_mode_changed` on the session bus — same treatment as the HTTP path. Reuse the existing `sendCurrentModeUpdateNotification` machinery (generalize it to take an explicit mode rather than deriving from a tool outcome).
-2. **Affirm + document the persist/visibility split** rather than change it:
-   - **Session-scoped broadcast** (peers attached to the _same_ session) fires on **every** change — they are viewing the same session, so they must always reflect its current mode.
-   - **Workspace-scoped broadcast** (peer _different_ sessions) stays gated on `persist=true`, because only a persisted change becomes those sessions' future default; a transient per-session mode is per-ACP-spec session-local and would mislead a peer session that didn't change.
-   - Encode this explicitly in the `approval_mode_changed` doc + a `scope: 'session' | 'workspace'` discriminator on the payload so consumers stop inferring it.
+**Session-scoped visibility (both entry points must emit):**
+
+1. Emit `current_mode_update` from `Session.setMode` (covers the ACP `setSessionMode` path, `acpAgent.ts:922`).
+2. **Also** emit it for the HTTP extMethod path — either route `acpAgent.ts:2228` through `Session.setMode` instead of calling `config.setApprovalMode` directly, or add the emit in the extMethod handler. Both agent entry points must produce the notification.
+3. Enrich the payload: `{ currentModeId, previousModeId }`. The bridge's `approval_mode_changed` bus event needs `{ previous, next, persisted }`; `previousModeId` supplies `previous`, `currentModeId` supplies `next`.
+
+**Workspace-scoped visibility stays at the bridge (NOT single-emitter):**
+
+4. The persist + workspace broadcast (`bridge.ts:3007`) remains a **bridge-level** publish gated on the bridge's own `persist` flag — the agent has no `persist` concept, so this cannot move to the notification path. `persisted` is therefore set only on the workspace-scoped event, by the bridge.
+5. Document the split explicitly with a `scope: 'session' | 'workspace'` discriminator on `approval_mode_changed`:
+   - **session-scoped** fires on every change (same-session peers must always reflect current mode);
+   - **workspace-scoped** fires only on `persist=true` (only then does it become peer _sessions_' future default; a transient per-session mode is ACP-spec session-local and would mislead a peer session that didn't change).
 
 ### Alternatives
 
-- Always workspace-broadcast (drop the persist gate). Rejected: leaks a session-local transient mode to peer sessions, contradicting ACP's per-session approval semantics.
+- Always workspace-broadcast (drop the persist gate). Rejected: leaks a session-local transient mode to peer sessions.
+- Force the HTTP path through `Session.setMode` _and_ remove the bridge publish entirely (full A1 symmetry). Rejected: loses the persist/workspace distinction, which only the bridge can make.
 
 ### Wire / compat
 
-Item 1 is additive (reuses `current_mode_update`). Item 2's `scope` field is additive; existing consumers ignore it.
+Additive: `current_mode_update` reuse + `previousModeId` + `scope`. Coordinate with PR #4510 (shared approval-mode code path / `approvalModeQueue`).
 
 ### Risk
 
-Low. Main care: don't double-emit when an HTTP `setSessionApprovalMode` already publishes and the agent's `setMode` notification would also publish — same single-emitter convergence decision as A1 (§2 item 4) applies. Coordinate with the A3 serialization PR (shared code path).
+Medium — the dual emit must be deduped against the bridge's session-scoped publish so a single HTTP change doesn't emit twice on the session bus. The demux suppression (§2.1) plus removing the bridge's session-scoped publish (while keeping the workspace one) is the intended end state. Test matrix in §8.
 
 ---
 
@@ -99,27 +126,26 @@ Low. Main care: don't double-emit when an HTTP `setSessionApprovalMode` already 
 
 ### Problem
 
-`permission_request.originatorClientId` = the **prompt originator**. `permission_resolved.originatorClientId` = the **voter** (`permissionMediator.ts:1124-1134`, stamped from `vote.clientId` for O8 pre-F3 wire compat). A consumer correlating the two events must special-case `permission_resolved` to know its `originatorClientId` means something different. The inconsistency is currently load-bearing wire shape (changing it is breaking).
+`permission_request.originatorClientId` = the **prompt originator**. `permission_resolved.originatorClientId` = the **voter** (`packages/acp-bridge/src/permissionMediator.ts:1125` emit, stamped from the `resolverClientId` param at `:1143`, itself the voter's trusted clientId for O8 pre-F3 wire compat). A consumer correlating the two events must special-case `permission_resolved`. The inconsistency is load-bearing wire shape (changing it is breaking).
 
 ### Proposed design (non-breaking)
 
-Add a dedicated, unambiguous field on `permission_resolved` and **deprecate the overloaded one** without removing it:
-
-- Emit `voterClientId` (canonical) alongside the existing `originatorClientId` (kept as a deprecated alias, same value) on `permission_resolved`.
-- SDK normalizer reads `voterClientId ?? originatorClientId` and exposes it as `voterClientId` in the typed UI event; the prompt originator stays available via correlation with the matching `permission_request`.
-- Document the deprecation: `originatorClientId` on `permission_resolved` is frozen for back-compat and will not change meaning; new consumers use `voterClientId`.
+- Emit `voterClientId` (canonical) alongside the existing `originatorClientId` on `permission_resolved`, **both optional and carrying the same value**.
+- **No-voter resolutions** (timer-driven expiry, session-closed, or a loopback voter with no `X-Qwen-Client-Id`) carry **neither** field — matching today's behavior where `originatorClientId` is omitted entirely. `voterClientId` is therefore `string | undefined`; consumers must handle its absence (a system-initiated resolution).
+- SDK normalizer reads `voterClientId ?? originatorClientId` and exposes it as optional `voterClientId`; the prompt originator stays available via correlation with the matching `permission_request`.
+- Document: `originatorClientId` on `permission_resolved` is frozen for back-compat; new consumers use `voterClientId`.
 
 ### Alternatives
 
-- **Unify semantics** (make `permission_resolved.originatorClientId` carry the prompt originator). Rejected: breaking wire change; pre-F3 consumers rely on the voter value.
+- **Unify semantics** (make `permission_resolved.originatorClientId` carry the prompt originator). Rejected: breaking; pre-F3 consumers rely on the voter value.
 
 ### Wire / compat
 
-Purely additive — old consumers keep reading `originatorClientId`; new consumers prefer `voterClientId`. Mirrors the D4 `lastReplayedEventId` aliasing pattern already accepted in the bugfix PR.
+Purely additive. Mirrors the D4 `lastReplayedEventId` aliasing pattern accepted in PR #4510.
 
 ### Risk
 
-Minimal. One audit point: any internal bridge/audit code reading `permission_resolved.originatorClientId` should be migrated to `voterClientId` for clarity (behavior unchanged).
+Minimal. Audit point: internal bridge/audit code reading `permission_resolved.originatorClientId` migrates to `voterClientId` for clarity (behavior unchanged).
 
 ---
 
@@ -127,49 +153,54 @@ Minimal. One audit point: any internal bridge/audit code reading `permission_res
 
 ### Problem
 
-A client attaching with `Last-Event-ID` (incl. `0`) gets ring replay + live tail, but **not** a snapshot of current side-channel state: approval mode, model, available commands, pending permissions. Today it must issue extra pulls (`requestSessionStatus` → `qwen/status/session/context` (`status.ts:96`), supported-commands, `POST /load`). `replay_complete` (added in #4484) tells the client _when_ it has caught up on the transcript, but not _what_ the current side-channel state is.
+A client attaching with `Last-Event-ID` (incl. `0`) gets ring replay + live tail, but **not** a snapshot of current side-channel state: approval mode, model, available commands. Today it must issue extra pulls (`requestSessionStatus` → `qwen/status/session/context`, `packages/acp-bridge/src/status.ts:96`; supported-commands; `POST /load`). `replay_complete` (#4484) says _when_ the transcript caught up, not _what_ the current side-channel state is.
 
 ### Proposed design
 
 Emit a single synthetic **`session_snapshot`** frame at subscribe time, before replay (id-less, same no-burn pattern as `state_resync_required` / `replay_complete`):
 
 ```
-session_snapshot {
-  approvalMode, model, availableCommands?, pendingPermissionIds?
-}
+session_snapshot { approvalMode, model, availableCommands? }
 ```
 
+- **`pendingPermissionIds` is deliberately excluded** (see Security below).
 - Built from the same sources the pull endpoints read, captured at subscribe time.
 - Ordering: `session_snapshot` → (optional `state_resync_required`) → replay frames → `replay_complete`. The snapshot is the baseline; subsequent `*_changed` deltas refine it.
-- SDK: normalize to a typed `session.snapshot` UI event that seeds the view-state reducer's side-channel fields, so a fresh attach renders correct mode/model immediately without a pull.
+- SDK: normalize to a typed `session.snapshot` UI event that seeds the view-state reducer's side-channel fields, so a fresh attach renders correct mode/model immediately.
+
+### Security: why no `pendingPermissionIds`
+
+Including pending request IDs in the snapshot would let a freshly-attached client immediately vote (`POST /session/:id/permission/:requestId`) on a request whose **context it never received** — `respondToSessionPermission` validates session/pending-state/option-legality but does **not** verify the voter ever observed the original `permission_request`. Under the `first-responder` policy a collaborator could attach, read a pending ID from the snapshot, and approve a destructive operation the original user was about to deny. A client that legitimately needs pending permissions learns them from replay (if still in the ring) where the full `permission_request` context travels with them.
 
 ### Alternatives
 
-- **Document the pull contract only** (no snapshot frame): client issues `GET context` + supported-commands after `replay_complete`. Lower effort, but keeps the extra round-trips and a window where the UI shows stale/empty side-channel state. Acceptable as a _phase 1_ if the snapshot frame is deferred.
+- **Document the pull contract only** (no snapshot frame): client pulls `GET context` + supported-commands after `replay_complete`. Lower effort; keeps the round-trips + a stale-UI window. Acceptable as **phase 1** if the frame is deferred.
 
 ### Wire / compat
 
-Additive synthetic frame; unknown-type frames are already ignored by SDKs (`asKnownDaemonEvent → undefined`). Opt-in via a subscribe flag (`?snapshot=1`) if we want to avoid the cost for clients that don't need it.
+Additive synthetic frame, **opt-in** via a subscribe flag (`?snapshot=1`). Note: an old SDK does not silently ignore an unknown frame — the UI normalizer's default case turns it into a `debug` UI event (`packages/sdk-typescript/src/daemon/ui/normalizer.ts`). That won't break, but it surfaces as debug noise, which is an additional reason to keep the frame opt-in.
 
 ### Risk
 
-Snapshot captured at subscribe time could be marginally stale vs the first live delta — acceptable because deltas refine it and ordering guarantees the snapshot precedes them. Cost: one extra status read per attach (gate behind the opt-in flag for high-churn anonymous attaches).
+Snapshot captured at subscribe time may be marginally stale vs the first live delta — acceptable, since deltas refine it and ordering guarantees the snapshot precedes them. Cost: one status read per opted-in attach.
 
 ---
 
 ## 6. Cross-cutting
 
-- **Single-emitter convergence (A1+A2).** The recurring decision: when both an HTTP route and an in-session notification can publish the same control event, make the **agent notification the single source** and have the HTTP route drive the agent without separately publishing. This removes double-broadcast risk and is the cleanest invariant. Requires touching `bridge.setSessionModel` / `setSessionApprovalMode` publish sites.
-- **Additive-alias pattern (A4).** Same shape as the accepted D4 `lastReplayedEventId` rename: emit canonical + deprecated alias, SDK prefers canonical. Keeps every change non-breaking.
-- **SDK reducer.** A1/A2 need no SDK change for basic correctness (reuse `model_switched` / `approval_mode_changed`); A4/A5 add typed fields/events the `reduceDaemonSessionEvents` view-state reducer should consume.
+- **Single-emitter applies to session-scoped broadcast only, and only where the HTTP path flows through the agent's `Session.*` method.** Verified asymmetry: A1's HTTP path goes through `Session.setModel` (single-emitter safe); A2's HTTP path uses a separate extMethod bypassing `Session.setMode` (needs a dedicated emit at that handler). **Workspace-scoped** broadcast (A2 persist) stays a bridge-level publish — the agent has no `persist` concept.
+- **Demux contract (§2.1) is a hard prerequisite** for A1/A2: without it, promoting a sessionUpdate sub-type either double-publishes (generic + named) or never promotes.
+- **Additive-alias pattern (A4, D4).** Emit canonical + deprecated alias; SDK prefers canonical. Every change non-breaking.
+- **SDK reducer.** A1 needs the demux + normalizer/reducer update for the promoted `current_mode_update` type change; A4/A5 add typed fields/events the `reduceDaemonSessionEvents` view-state reducer consumes.
 
 ---
 
 ## 7. Sequencing
 
 1. **A4** (smallest, purely additive alias) — land first.
-2. **A1 + A2** together (shared single-emitter convergence in the bridge + symmetric `current_*_update` emits in `Session`).
-3. **A5** — phase 1 documents the pull contract; phase 2 adds the opt-in `session_snapshot` frame.
+2. **§2.1 demux layer + A1** — the demux contract, then `current_model_update` emit + promotion + generic-wrapper suppression + SDK update.
+3. **A2** — both-entry-point emit (incl. the extMethod handler change), `previousModeId`, `scope` field, retain the bridge workspace publish.
+4. **A5** — phase 1 documents the pull contract; phase 2 adds the opt-in `session_snapshot` frame.
 
 Each lands as its own implementation PR after this design is approved.
 
@@ -177,15 +208,29 @@ Each lands as its own implementation PR after this design is approved.
 
 ## 8. Test plan
 
-- **A1:** in-session `/model` switch publishes exactly one `model_switched`; HTTP `POST /session/:id/model` publishes exactly one (no double); peer subscriber observes the change.
-- **A2:** in-session `setMode` publishes `approval_mode_changed` on the session bus; non-persisted change does NOT workspace-broadcast to peer sessions; persisted change does; `scope` field correct on both.
-- **A4:** `permission_resolved` carries both `voterClientId` and `originatorClientId` with the voter value; SDK normalizer surfaces `voterClientId`; correlation with `permission_request` still yields the prompt originator.
-- **A5:** attach with `?snapshot=1` yields a `session_snapshot` before replay with correct mode/model/pending-permissions; ordering snapshot → resync? → replay → replay_complete; SDK seeds side-channel state from it.
+- **Demux (§2.1):** a promoted sub-type publishes the named event and **suppresses** the generic `session_update`; an unknown sub-type still publishes generic.
+- **A1:** in-session `/model` publishes exactly one `model_switched`; HTTP `POST /session/:id/model` publishes exactly one (no double); peer subscriber observes it.
+- **A2:** in-session `setMode` AND HTTP `POST /approval-mode` each publish a session-scoped `approval_mode_changed` (`scope:'session'`); non-persisted change does NOT workspace-broadcast; persisted change emits an additional `scope:'workspace'` event; no double-emit on the session bus.
+- **A4:** voter resolution carries `voterClientId` (= `originatorClientId`); timer/no-clientId resolution carries neither; SDK surfaces optional `voterClientId`; correlation with `permission_request` still yields the prompt originator.
+- **A5:** attach with `?snapshot=1` yields a `session_snapshot` (mode/model/commands, **no** pendingPermissionIds) before replay; ordering snapshot → resync? → replay → replay_complete; SDK seeds side-channel state.
 
 ---
 
-## 9. Open questions
+## 9. Resolved decisions
 
-1. **A1/A2 emitter ownership:** confirm the agent can always emit `current_model_update` / `current_mode_update` for HTTP-initiated changes too (so the route can drop its own publish), or whether some HTTP paths bypass the agent and must keep publishing.
-2. **A5 default:** snapshot opt-in (`?snapshot=1`) vs always-on. Lean opt-in to protect anonymous/high-churn attaches.
-3. **A2 `scope` field:** new discriminator vs documenting the existing implicit behavior only.
+**Emitter ownership (resolves the former Open Question — verified against code):**
+
+| HTTP / in-session entry           | agent path                                                                   | flows through `Session.*`?        | session-scoped emit source                      | workspace publish                          |
+| --------------------------------- | ---------------------------------------------------------------------------- | --------------------------------- | ----------------------------------------------- | ------------------------------------------ |
+| `POST /session/:id/model`         | `unstable_setSessionModel` (`acpAgent.ts:925`) → `session.setModel` (`:935`) | ✅ `Session.setModel`             | agent `current_model_update`                    | n/a                                        |
+| in-session `/model`               | `Session.setModel` directly                                                  | ✅                                | agent `current_model_update`                    | n/a                                        |
+| ACP `setSessionMode`              | `acpAgent.ts:922` → `session.setMode`                                        | ✅ `Session.setMode`              | agent `current_mode_update` (to add)            | n/a                                        |
+| `POST /session/:id/approval-mode` | extMethod `acpAgent.ts:2200` → `config.setApprovalMode` (`:2228`)            | ❌ **bypasses** `Session.setMode` | **emit must be added at the extMethod handler** | bridge, `persist`-gated (`bridge.ts:3007`) |
+
+Conclusion: A1 can drop the bridge-side publish (agent is sole session-scoped emitter). A2 must add an emit at the extMethod handler AND retain the bridge's workspace-scoped publish.
+
+## 10. Open questions
+
+1. **A2 extMethod emit placement:** route `acpAgent.ts:2228` through `Session.setMode`, or add a parallel `current_mode_update` emit in the extMethod handler? The former is DRY-er but changes the call graph; the latter is more local. Lean toward routing through `Session.setMode` for symmetry, pending a check that `Session.setMode`'s ApprovalMode mapping covers every value the extMethod accepts.
+2. **A5 default:** snapshot opt-in (`?snapshot=1`) vs always-on. Lean opt-in (the `debug`-noise + status-read cost on anonymous/high-churn attaches).
+3. **A2 `scope` field:** new discriminator vs documenting the implicit behavior only. Lean toward the explicit field.
