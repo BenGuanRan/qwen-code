@@ -7,6 +7,13 @@
 
 ## Changelog
 
+### v7 (2026-05-26) — implementation-start feasibility correction (A1 transport)
+
+- **A1 cannot use a `current_model_update` sessionUpdate — that type does not exist in ACP.** Verified at implementation start: `SessionUpdate` is the external `@agentclientprotocol/sdk` type; `acp.d.ts` defines `current_mode_update` (2 matches) but **`current_model_update` (0 matches)**. You cannot add a variant to the external spec'd union. v1–v6's "add a `current_model_update` sessionUpdate" (and the §2 "Alternative" that _rejected_ extNotification for symmetry) was wrong.
+- **Corrected A1 transport: the agent emits the in-session model change via `BridgeClient.extNotification()`** (`bridgeClient.ts:491`, the existing agent→bridge side-channel used today for MCP guardrails) — NOT a sessionUpdate. The A1 demux therefore lives in **`extNotification()`**, while A2's `current_mode_update` (a real ACP sessionUpdate) is demuxed in **`sessionUpdate()`**. A1 and A2 use different transports + insertion points — a new asymmetry, now documented.
+- Net effect on the rest of the design: the demux rules (payload mapping, per-type suppress, staleness check, drop-when-suppressed, observability) are unchanged in spirit; only A1's insertion point moves from `sessionUpdate()` to `extNotification()`, and A1 needs no ACP-spec change.
+- **This is why design-first matters:** the blocker surfaced on the first line of A1 implementation; flipping the transport in the doc is cheap, a cast onto the external `SessionUpdate` union would have been a latent type-lie.
+
 ### v6 (2026-05-26) — fifth review round (wenshao 2×Critical + 4×Suggestion)
 
 - **Timeout-race + intervening change (Critical):** "later event is authoritative" was wrong when a change B intervenes — a stale late `current_model_update(A)` would promote after `model_switched(B)`. Replaced with a **staleness check**: the demux promotes a `current_model_update` only if its `currentModelId` equals the agent's actual current model at promotion time; stale notifications are dropped. §2 item 4 / §2.1.
@@ -92,14 +99,19 @@ v1's "agent is the single emitter; bridge drops its publish" was **rejected** �
 
 ### Proposed design
 
-1. Add ACP `current_model_update`: `{ sessionUpdate, currentModelId, previousModelId? }`. Emit from `Session.setModel` after `switchModel` resolves (**success only**; on failure it throws and emits nothing). (`authType` was dropped — the `model_switched` bus event is `{sessionId,modelId}` and the SDK `model.changed` normalizer reads only `modelId`, so `authType` would be dead data; `previousModelId` is optional since the normalizer doesn't require it.)
-2. `BridgeClient.sessionUpdate()` demuxes `current_model_update` → `model_switched` (§2.1), **only when no bridge model roundtrip is in flight** for that session.
+1. **Transport: `extNotification`, not a sessionUpdate (v7).** `current_model_update` is **not** an ACP `SessionUpdate` variant (the type is external `@agentclientprotocol/sdk`; only `current_mode_update` is spec'd). So `Session.setModel`, after `switchModel` resolves (**success only**; on failure it throws and emits nothing), emits the change via the agent→bridge **`extNotification`** side-channel as `{ method:'current_model_update', sessionId, currentModelId, previousModelId? }`. (`authType` dropped — `model_switched` is `{sessionId,modelId}`; `previousModelId` optional since the `model.changed` normalizer reads only `modelId`.)
+2. **`BridgeClient.extNotification()` (`bridgeClient.ts:491`) demuxes** the `current_model_update` notification → `model_switched` (§2.1), **only when no bridge model roundtrip is in flight** for that session. (A2's `current_mode_update` stays a real sessionUpdate, demuxed in `sessionUpdate()` — see §2.1.)
 3. **`model_switch_failed` stays bridge-only** — `Session.setModel` throws with no notification; the bridge keeps publishing it on both failure paths.
 4. **Timeout-race contract (staleness check, not "later wins").** The bridge's `withTimeout` (`bridge.ts:2844-2849`) can reject (publishing `model_switch_failed(A)`) while A's ACP call keeps running (FIXME `bridge.ts:2836-2840`). If a change B then succeeds (`model_switched(B)`) and A's call finally completes, A's late `current_model_update(A)` would — under a naive "later event is authoritative" rule — promote to `model_switched(A)` and make A the apparent final state, though B was the last intentional change. **Fix:** the demux promotes a `current_model_update` **only if its `currentModelId` equals the agent's actual current model at promotion time** (a staleness check); a stale A-after-B notification is dropped. This is the same freshness predicate the §2.2 reconciliation uses, applied at the promotion gate.
 
-### 2.1 Demux contract (in `BridgeClient.sessionUpdate()`, `bridgeClient.ts:397`)
+### 2.1 Demux contract (two insertion points)
 
-Today this method publishes every notification verbatim as `{ type: 'session_update', data: params }`. The demux adds:
+The demux has **two insertion points** because A1 and A2 use different transports (v7):
+
+- **A1 — `BridgeClient.extNotification()` (`bridgeClient.ts:491`):** the `current_model_update` notification → `model_switched`.
+- **A2 — `BridgeClient.sessionUpdate()` (`bridgeClient.ts:397`):** the `current_mode_update` sessionUpdate → `approval_mode_changed`. This method today publishes every notification verbatim as `{ type: 'session_update', data: params }`; the demux is added here.
+
+The rules below apply at whichever insertion point the sub-type arrives:
 
 - **Promotion table:** `current_model_update → model_switched`; `current_mode_update → approval_mode_changed` (session-scoped; deferred to step 3, see §7).
 - **Payload mapping (both sub-types must be specified, else SDK validation drops them):**
@@ -229,7 +241,7 @@ Phase-1: document the pull contract only (pull after `replay_complete`); defer t
 
 ## 6. Cross-cutting
 
-- **Bridge-authoritative model (§1.1)**: bridge owns events for changes it drives; in-session changes add a notification the bridge demuxes (`bridgeClient.ts:397`); suppress + drop-when-suppressed prevent double-signal. Suppression is meaningful for the model path only; HTTP approval-mode has no agent notification.
+- **Bridge-authoritative model (§1.1)**: bridge owns events for changes it drives; in-session changes add a notification the bridge demuxes — A1 via `extNotification()` (`bridgeClient.ts:491`), A2 via `sessionUpdate()` (`bridgeClient.ts:397`); suppress + drop-when-suppressed prevent double-signal. Suppression is meaningful for the model path only; HTTP approval-mode has no agent notification.
 - **Demux (§2.1) is a hard prerequisite**; A2 additionally **blocked on #4510** (`approvalModeQueue`).
 - **NOT additive everywhere; handled by a dual-emit transition.** Promoting `current_mode_update` → `approval_mode_changed` changes the observed event type. The daemon and the VS Code IDE companion ship on **different channels** (CLI auto-update vs Marketplace), so the flip can't be atomic. **Affected consumer chain (all must gain an `approval_mode_changed` path):**
   - `packages/vscode-ide-companion/src/services/qwenSessionUpdateHandler.ts:177` (`case 'current_mode_update'`) — the leaf handler;
@@ -244,7 +256,7 @@ Phase-1: document the pull contract only (pull after `replay_complete`); defer t
 ## 7. Sequencing
 
 1. **A4** — additive wire + SDK alias. Smallest, unblocked.
-2. **§2.1 demux skeleton + A1** — implement the demux in `bridgeClient.ts` covering **`current_model_update` → `model_switched` only** (with the field mapping `currentModelId→data.modelId` + `sessionId`); `current_mode_update` keeps flowing as generic `session_update` (no regression) until step 3. Includes suppress + drop-when-suppressed + §2.2 reconciliation + `model_switch_failed` carve-out + demux observability + SDK update.
+2. **A1 — `current_model_update` via `extNotification`** — `Session.setModel` emits the `extNotification`; the demux in `BridgeClient.extNotification()` (`bridgeClient.ts:491`) promotes it to `model_switched` (field mapping `currentModelId→data.modelId` + `sessionId`). Includes per-type suppress + staleness check + drop-when-suppressed + §2.2 reconciliation + `model_switch_failed` carve-out + observability. No ACP-spec change, no SDK change (consumers see the existing `model_switched`). A2's `current_mode_update` sessionUpdate demux is deferred to step 3.
 3. **A2 — BLOCKED on PR #4510** (`approvalModeQueue`). Adds `current_mode_update` promotion (with `previousModeId`), `Session.setMode` emit + previous-mode capture, helper generalization, `scope`, retained bridge workspace publish, the **dual-emit transition** + IDE-companion + upstream-dispatch updates.
 4. **A5** — phase 1 pull-contract docs; phase 2 opt-in `session_snapshot` (capture-at-emission in a synchronous block; after `replay_complete` on resume, self-delimiting first frame on first-attach). `replay_complete` already exists (#4484); only `session_snapshot` is new.
 
