@@ -1,6 +1,6 @@
 # Daemon side-channel coordination — Design (A1 / A2 / A4 / A5)
 
-> Targets `daemon_mode_b_main` (per #4175 branching strategy). Author: 秦奇. Date: 2026-05-25. Revised: 2026-05-27 (v12 — helper signature + structural non-recursion guard).
+> Targets `daemon_mode_b_main` (per #4175 branching strategy). Author: 秦奇. Date: 2026-05-25. Revised: 2026-05-27 (v13 — §7 atomic-coupling notes + §8 bounded-call-count assertion).
 > **Docs-only / design-first.** A4 implemented + approved (#4539); A1 implemented (#4546).
 >
 > Source: cross-client real-time sync audit (2026-05-24) + PR #4484 post-merge review (the **A-series** follow-ups). The bugfix/cleanup follow-ups from the same review ship separately (PR #4510) and are **out of scope here**.
@@ -333,8 +333,10 @@ Phase-1: document the pull contract only (pull after `replay_complete`); defer t
 1. **A4** — additive wire + SDK alias. Smallest, unblocked.
 2. **A1 — `current_model_update` via `extNotification`** (shipped as #4546 core) — `Session.setModel` emits the `extNotification`; the demux in `BridgeClient.extNotification()` (`bridgeClient.ts:491`) promotes it to `model_switched`. Core path + per-type suppress + observability done in #4546; **the §2.3 state cache + staleness check + §2.2 reconciliation are the A1 follow-up** (they need the cache fields).
    - **2b. §2.3 bridge state cache** — add `currentModelId`/`currentApprovalMode`/`availableCommands` to `SessionEntry`, updated at every publish + seeded on create. Prerequisite for the A1 staleness/reconciliation follow-up AND for A5.
+   - **2c. Atomic coupling:** reconciliation and `modelPublishGeneration` guard are a single atomic deliverable; shipping reconciliation without the guard creates a clobber regression (concurrent promotion during the async `getSessionContextStatus` read would write a stale value back). Both must land in the same PR.
 3. **A2 — BLOCKED on PR #4510** (`approvalModeQueue`). Adds `current_mode_update` promotion (`previous` derived from the §2.3 cache — no `previousModeId` on the wire), `Session.setMode` emit, helper generalization, `scope`, retained bridge workspace publish, the **dual-emit transition** + IDE-companion + upstream-dispatch updates.
    - **3b. Dual-emit removal** — tracked by a GitHub issue with a target release; the dual-emit publish site carries `TODO(dual-emit-removal)` referencing §2.1. Close the issue when the next release drops the dual-emit.
+   - **3c. A2 post-roundtrip reconciliation** — same §2.2 contract, reading the agent's true approval mode; adds `approvalModePublishGeneration` and `publishApprovalModeChanged` helper. Must land together with the A2 promotion (same rationale as 2c — reconciliation without the generation guard is worse than no reconciliation).
 4. **A5** — phase 1 pull-contract docs; phase 2 opt-in `session_snapshot` (capture-at-emission in a synchronous block; after `replay_complete` on resume, self-delimiting first frame on first-attach). `replay_complete` already exists (#4484); only `session_snapshot` is new.
 
 Each lands as its own implementation PR after this design is approved.
@@ -362,7 +364,7 @@ Each lands as its own implementation PR after this design is approved.
 - **Compat migration (§2.1):** an SDK reducer previously fed `current_mode_update` as generic `session_update` reaches identical state once it's promoted to `approval_mode_changed`.
 - **Helper regression (§3 point 4):** `exit_plan_mode` and `ProceedAlways` callers still produce correct `current_mode_update` payloads after the helper is generalized.
 - **Double-emit edge (§3):** concurrent `/approval-mode` + `ProceedAlways` both emit; reducer converges.
-- **Non-recursion structural guard (§2.2):** while reconciliation is in flight (`reconciliationInFlight === true`), a concurrent promotion that would trigger reconciliation is **skipped** (`action=skipped-reentrant`); the flag resets after the in-flight reconciliation settles regardless of outcome.
+- **Non-recursion structural guard (§2.2):** while reconciliation is in flight (`reconciliationInFlight === true`), a concurrent promotion that would trigger reconciliation is **skipped** (`action=skipped-reentrant`); the flag resets after the in-flight reconciliation settles regardless of outcome. Additionally: after a reconciliation corrective `model_switched` fires, assert `getSessionContextStatus` is invoked **exactly once** for the triggering settle event — the corrective publish does NOT re-enter the reconciliation path (bounded call count).
 - **Failure-path converged (§2.2):** `model_switch_failed` fires → reconciliation reads `getSessionContextStatus` → returns `entry.currentModelId` (unchanged) → no corrective emitted (`action=converged`); bus state unchanged.
 - **Generation counter values (§2.3):** after a promote → reconciliation → corrective sequence, `entry.modelPublishGeneration` equals `gen_before + 2` (one for the initial promote, one for the corrective); `gen_before`/`gen_after` logged in observability match the counter values at entry/exit of reconciliation.
 
