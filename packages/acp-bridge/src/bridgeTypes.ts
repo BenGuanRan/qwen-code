@@ -204,7 +204,10 @@ export interface HttpAcpBridge {
    */
   subscribeEvents(
     sessionId: string,
-    opts?: SubscribeOptions,
+    opts?: SubscribeOptions & {
+      /** Yield a synthetic `session_snapshot` frame after replay completes. */
+      snapshot?: boolean;
+    },
   ): AsyncIterable<BridgeEvent>;
 
   /**
