@@ -9,7 +9,7 @@
 - 一次性 **canonicalize** 绑定的 workspace（同一份规范形式同时供 `/capabilities`、`POST /session` 兜底和 bridge 使用）。
 - 拒绝以不安全的姿势启动：非 loopback 绑定无 token；`--require-auth` 无 token；`mcpBudgetMode='enforce'` 无正整数 `mcpClientBudget`；`--workspace` 不存在或不是目录。
 - 构造 `WorkspaceFileSystem` 工厂、权限审计 publisher、`DaemonStatusProvider`、`acp-bridge`。
-- 构造 Express 应用、装配中间件链（`bearerAuth` → `hostAllowlist` → `denyBrowserOriginCors` → 每路由 `mutationGate`）、挂载路由（session、workspace CRUD、文件、Device Flow auth、权限投票）。
+- 构造 Express 应用、装配中间件链（`denyBrowserOriginCors` → `hostAllowlist` → `bearerAuth` → 每路由 `mutationGate`）、挂载路由（session、workspace CRUD、文件、Device Flow auth、权限投票）。
 - 绑定监听端口并注册信号 handler。
 - 收到 SIGINT/SIGTERM 时两阶段退出；二次信号强退。
 

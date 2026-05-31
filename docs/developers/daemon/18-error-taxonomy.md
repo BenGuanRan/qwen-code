@@ -11,7 +11,7 @@ Wire 错误形状在 [`../qwen-serve-protocol.md`](../qwen-serve-protocol.md)；
 
 ## 文件系统边界（`packages/cli/src/serve/fs/errors.ts`）
 
-`FsError` 带 `{ kind, message, status, cause? }`。`FsErrorKind` 联合（13 种，默认 HTTP 状态）：
+`FsError` 带 `{ kind, message, status, cause? }`。`FsErrorKind` 联合（14 种，默认 HTTP 状态）：
 
 | Kind                     | HTTP      | 原因                                                                          | 修复                                                                                                |
 | ------------------------ | --------- | ----------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
@@ -50,7 +50,7 @@ bridge / mediator 抛的 typed class，多数路由 handler 通过 switch 给出
 | `WorkspaceInitSymlinkError`           | 400  | init 路径是 symlink                                            | 直接寻址解析后路径                                                                                                                                                  |
 | `WorkspaceInitRaceError`              | 409  | init 上 TOCTOU 竞态                                            | 重试                                                                                                                                                                |
 | `McpServerNotFoundError`              | 404  | 未知 server 的 restart                                         | 在 `/workspace/mcp` 核对名字                                                                                                                                        |
-| `McpServerRestartFailedError`         | 500  | ACP child 内部 restart 失败                                    | 查 ACP child 日志；可能 MCP server 坏了                                                                                                                             |
+| `McpServerRestartFailedError`         | 502  | ACP child 内部 restart 失败                                    | 查 ACP child 日志；可能 MCP server 坏了                                                                                                                             |
 | `InvalidPermissionOptionError`        | 400  | wire 投票通过 `optionId` 注入 `CANCEL_VOTE_SENTINEL`           | 改用 `{outcome: 'cancelled'}` 投票而不是 `optionId`                                                                                                                 |
 | `PermissionForbiddenError`            | 403  | 策略拒了投票者（`designated_mismatch` / `remote_not_allowed`） | designated → 用 originator clientId；consensus → 预先注册 voter；local-only → 从 loopback 投票（详见 [`04-permission-mediation.md`](./04-permission-mediation.md)） |
 | `CancelSentinelCollisionError`        | 500  | agent 发布 `'__cancelled__'` 作为合法 option 标签              | agent bug —— 改 option 标签                                                                                                                                         |

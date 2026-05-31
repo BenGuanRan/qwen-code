@@ -133,19 +133,6 @@ SSE 事件 `auth_device_flow_{started, throttled, authorized, failed, cancelled}
 
 长度保持（每个被剥码点替换为 `?` 而不是消失），operator 在那索引处仍能看出有东西曾经在。两层都用：`qwenDeviceFlowProvider` 净化 IdP 的 `oauthError`，registry 的 late-poll 观察者净化插值进 audit hint 的 provider 可控值（`latePollResult.kind` / `lateErr.name`）。
 
-**日志注入 / Trojan-Source 防御**：`sanitizeForStderr(value)`（`deviceFlow.ts:47-72`）剥掉 ASCII C0 / DEL / C1 控制字符**外加** Unicode 同形字符 —— 恶意 IdP 可能用它们伪造日志行或隐藏 payload：
-
-| 范围                             | 为什么剥                                                                                                                                                                                                          |
-| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `\x00–\x1f`、`\x7f`、`\x80–\x9f` | ASCII C0 / DEL / C1，日志行伪造、终端控制序列                                                                                                                                                                     |
-| `​–‏`                            | Zero-width 字符 + LRM/RLM，隐形但能改终端渲染                                                                                                                                                                     |
-| `–`                              | LINE / PARAGRAPH SEPARATOR，许多 Unicode-aware 终端把它当换行，最直接的日志伪造向量                                                                                                                               |
-| `‪–‮`                            | 双向 EMBEDDING / OVERRIDE 控制                                                                                                                                                                                    |
-| `⁦–⁩`                            | 双向 ISOLATE 控制（LRI / RLI / FSI / PDI），[CVE-2021-42574 "Trojan Source"](https://trojansource.codes/) 主攻击向量。恶意 IdP 用 U+2066 (LRI) 替换 U+202D (LRO) 会绕过 EMBEDDING/OVERRIDE 范围却达到同样视觉重排 |
-| `﻿`                              | BOM / 零宽不折断空格                                                                                                                                                                                              |
-
-长度保持（每个被剥码点替换为 `?` 而不是消失），operator 在那索引处仍能看出有东西曾经在。两层都用：`qwenDeviceFlowProvider` 净化 IdP 的 `oauthError`，registry 的 late-poll 观察者净化插值进 audit hint 的 provider 可控值（`latePollResult.kind` / `lateErr.name`）。
-
 `auth_device_flow` 能力 tag **无条件**广播；路由本身在 daemon 不支持指定 provider 时返 `400 unsupported_provider`。支持的 provider 列表在 `/workspace/auth/status` 而不是 `/capabilities`，保持 descriptor 形状统一。
 
 ## 流程

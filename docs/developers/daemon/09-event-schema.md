@@ -1,7 +1,7 @@
 # Typed Daemon Event Schema v1
 ## 概览
 
-daemon 在 `GET /session/:id/events` 上发的每一帧 SSE 都形如 `{ id, v, type, data, originatorClientId?, _meta? }`，`v: 1` 是当前 `EVENT_SCHEMA_VERSION`。`type` 取自一个封闭的、版本固定的集合 —— `DAEMON_KNOWN_EVENT_TYPE_VALUES`（`packages/sdk-typescript/src/daemon/events.ts:13-63`）共 **29 种**。envelope 的 `_meta` 字段在 SSE 写边界（`server.ts` 的 `formatSseFrame()`）盖上 —— 详见下文 [Envelope 级元数据](#envelope-级元数据)。
+daemon 在 `GET /session/:id/events` 上发的每一帧 SSE 都形如 `{ id, v, type, data, originatorClientId?, _meta? }`，`v: 1` 是当前 `EVENT_SCHEMA_VERSION`。`type` 取自一个封闭的、版本固定的集合 —— `DAEMON_KNOWN_EVENT_TYPE_VALUES`（`packages/sdk-typescript/src/daemon/events.ts:14-112`）共 **38 种**。envelope 的 `_meta` 字段在 SSE 写边界（`server.ts` 的 `formatSseFrame()`）盖上 —— 详见下文 [Envelope 级元数据](#envelope-级元数据)。
 
 SDK 暴露 `narrowDaemonEvent(evt)`，对已知 type 返回一个判别式 `KnownDaemonEvent`，对其他 type 返回 `{ kind: 'unknown' }` —— SDK 消费方无需固定 SDK 版本就能处理向前兼容（更新的 daemon 加了新 type 也不会崩）。
 
@@ -14,7 +14,7 @@ wire 格式见 [`../qwen-serve-protocol.md`](../qwen-serve-protocol.md)，本文
 - 提供纯 reducer（`reduceDaemonSessionEvent`、`reduceDaemonAuthEvent`），把事件流投影成 SDK view-state。
 - 通过 `typed_event_schema` 能力 tag 广播（信息性 —— 不广播时 `narrowDaemonEvent` 仍 fallback 到 `unknown`）。
 
-## 事件词汇表（29 种）
+## 事件词汇表（38 种）
 
 按域分组。
 
@@ -35,6 +35,7 @@ wire 格式见 [`../qwen-serve-protocol.md`](../qwen-serve-protocol.md)，本文
 | `slow_client_warning`   | 队列 ≥ 75%（force-push，**无 `id`**）                                                                                                       | `queueSize, maxQueued, lastEventId`；37.5% 滞回 re-arm                                                                                                                                                                                                                                                                                |
 | `stream_error`          | `SubscriberLimitExceededError` 或其他路由流错                                                                                               | `error: string`；订阅终态                                                                                                                                                                                                                                                                                                             |
 | `state_resync_required` | `subscribe({lastEventId})` 时 daemon 环里已不再持有 `[lastEventId+1, earliestInRing-1]` 这段间隙。在剩余 replay 帧**之前**强推。**无 `id`** | `reason: string`（当前恒为 `'ring_evicted'`）、`lastDeliveredId: number`、`earliestAvailableId: number`。**面向恢复，非终态** —— SSE 流保持打开，replay + live 帧继续；SDK reducer 翻转 `awaitingResync = true`，自动跳过 delta，直到调用方调 `loadSession` 重置。daemon 端实现见 `eventBus.ts:359-402`，SDK 端见 `events.ts:870-905` |
+| `replay_complete`       | `Last-Event-ID` 重放循环结束时强推的 id-less 哨兵；clean-replay 与 ring-evicted（`state_resync_required`）两条路径都发，即使无帧可重放（`data.replayedCount === 0`）也发。**无 `id`** | `replayedCount: number`；消费方据此确定性地撤掉 catch-up 指示，不必靠超时 |
 
 ### Permissions（F3 + base）
 
@@ -84,12 +85,30 @@ wire 格式见 [`../qwen-serve-protocol.md`](../qwen-serve-protocol.md)，本文
 | `auth_device_flow_failed`     | S→C  | `deviceFlowId, errorKind, hint?`                      |
 | `auth_device_flow_cancelled`  | S→C  | `deviceFlowId`                                        |
 
+### MCP runtime mutation（运行时增删 server）
+
+| Type                 | 方向 | 触发                                       | Payload 关键字段                                                             |
+| -------------------- | ---- | ------------------------------------------ | ---------------------------------------------------------------------------- |
+| `mcp_server_added`   | S→C  | 运行时经 `POST /workspace/mcp` 新增 server | `name, transport, replaced, shadowedSettings, toolCount, originatorClientId` |
+| `mcp_server_removed` | S→C  | 运行时移除 server                          | `name, wasShadowingSettings, originatorClientId`                             |
+
+### Turn 生命周期 / 助手推送（assist）
+
+| Type                  | 方向 | 触发                                                                       | Payload 关键字段                                                                  |
+| --------------------- | ---- | -------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| `prompt_cancelled`    | S→C  | prompt 被取消（显式 `cancelSession` 路由 **或** originator SSE 断开）       | envelope 盖 `originatorClientId`（取消方）；语义是「请求取消」而非「确认取消」     |
+| `turn_complete`       | S→C  | 一个 turn 正常结束                                                         | `sessionId, stopReason, promptId?`                                                |
+| `turn_error`          | S→C  | turn 出错                                                                  | `sessionId, message, code?, promptId?`                                            |
+| `followup_suggestion` | S→C  | end_turn 后 ACP child 生成的 ghost-text 后续建议，经 per-session SSE 转发   | `sessionId, suggestion, promptId`（wire 只带 `getFilterReason()===null` 的建议）  |
+| `user_shell_command`  | S→C  | 用户在某客户端发起的 shell 命令，扇出给同 session 其他订阅者                | sessionId-keyed；payload 契约在 `daemon_mode_b_main` 上仍保留中（暂无 typed 接口） |
+| `user_shell_result`   | S→C  | 上述 shell 命令的结果回传                                                  | 同上                                                                              |
+
 ## 架构
 
 | 关注点                                 | 文件:行                                              | 说明                                                               |
 | -------------------------------------- | ---------------------------------------------------- | ------------------------------------------------------------------ |
 | `EVENT_SCHEMA_VERSION = 1`             | `packages/acp-bridge/src/eventBus.ts:22`             | 每帧带                                                             |
-| `DAEMON_KNOWN_EVENT_TYPE_VALUES`       | `packages/sdk-typescript/src/daemon/events.ts:13-63` | 封闭列表（长 28）                                                  |
+| `DAEMON_KNOWN_EVENT_TYPE_VALUES`       | `packages/sdk-typescript/src/daemon/events.ts:14-112` | 封闭列表（长 38）                                                 |
 | `DaemonEventEnvelope<TType, TData>`    | `events.ts:74-78`                                    | 泛型 envelope                                                      |
 | `DaemonKnownEventType`                 | `events.ts:71-72`                                    | `typeof DAEMON_KNOWN_EVENT_TYPE_VALUES[number]`                    |
 | 各事件 payload 类型                    | `events.ts:80+`                                      | 每种 type 一个 `DaemonXxxData` interface                           |
@@ -147,7 +166,7 @@ flowchart LR
 
 ### `_meta.serverTimestamp` —— daemon 时钟
 
-在 `formatSseFrame()`（`packages/cli/src/serve/server.ts:2602+`）的 SSE 写边界盖，**不**在 `EventBus.publish`。这样内存里的 `BridgeEvent` 类型不变，内部 daemon 消费方看不到 `_meta`，只有 wire 上的 SSE 帧带。
+在 `formatSseFrame()`（`packages/cli/src/serve/server.ts:3629`）的 SSE 写边界盖，**不**在 `EventBus.publish`。这样内存里的 `BridgeEvent` 类型不变，内部 daemon 消费方看不到 `_meta`，只有 wire 上的 SSE 帧带。
 
 ```jsonc
 // 盖完之后 wire 上的一帧
@@ -208,7 +227,7 @@ UI 据此渲染 builtin / MCP server badge / subagent 归属的 tool call，不�
 - 新增已知 type → append 到 `DAEMON_KNOWN_EVENT_TYPE_VALUES`。老 SDK 看到 `kind: 'unknown'` 直接忽略；新 SDK 依赖判别式联合类型。
 - 给已有 payload 加可选字段 → 安全（`{ [key: string]: unknown }` 是开的）。
 - 改已有 payload 的**形状** → break；必须 bump `EVENT_SCHEMA_VERSION` 并依赖 `caps.features.typed_event_schema_v2` 之类的能力 tag 兼容。
-- `id` 是每 session 单调，合成终态帧（`client_evicted`、`slow_client_warning`、`stream_error`）刻意无 id，防止其他订阅者看到序号断档。
+- `id` 是每 session 单调，合成帧（`client_evicted`、`slow_client_warning`、`stream_error`、`state_resync_required`、`replay_complete`）刻意无 id，防止其他订阅者看到序号断档。
 - `originatorClientId` 在 envelope 而非 `data`。F3 的 partial-vote / forbidden payload 同时也把它盖到 `data`（`mergeOriginator`），view-state 消费方就不必保留 envelope。
 
 ## 依赖
@@ -225,7 +244,7 @@ UI 据此渲染 builtin / MCP server badge / subagent 归属的 tool call，不�
 
 ## 注意 & 已知局限
 
-- 三种合成帧故意无 `id`，SDK 代码不能假设每个事件都有 id。
+- 五种合成帧故意无 `id`，SDK 代码不能假设每个事件都有 id。
 - `permission_partial_vote` 只在 `consensus` 下出现；`permission_forbidden` 在 `designated` / `consensus` / `local-only` 下出现，**不在** `first-responder` 下出现。
 - `mcp_child_refused_batch` 只在 `mode: 'enforce'` 下出现，`warn` 模式从不拒绝。
 - `auth_device_flow_*` 事件不是 session-keyed；通过 `DaemonSessionClient` 消费时必须走 `reduceDaemonAuthEvent`，不要走 session reducer。

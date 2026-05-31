@@ -32,7 +32,7 @@ HTTP 文件路由（`GET /file`、`GET /file/bytes`、`POST /file/write`、`POST
 | `paths.ts`               | `canonicalizeWorkspace`、`resolveWithinWorkspace`、`hasSuspiciousPathPattern`、branded `ResolvedPath`、`Intent`（`read \| write \| list \| stat \| glob`）                                                |
 | `policy.ts`              | `MAX_READ_BYTES`、`MAX_WRITE_BYTES`、`BINARY_PROBE_BYTES`、`assertTrustedForIntent`、`detectBinary`、`enforceReadBytesSize`、`enforceReadSize`、`enforceWriteSize`、`shouldIgnore`                        |
 | `audit.ts`               | `FS_ACCESS_EVENT_TYPE`、`FS_DENIED_EVENT_TYPE`、`createAuditPublisher`、audit payload 类型                                                                                                                |
-| `errors.ts`              | `FsError` 类、`isFsError`、`FsErrorKind`（13 种）、`FsErrorStatus`（`400 / 403 / 404 / 409 / 413 / 422 / 500 / 503`）                                                                                     |
+| `errors.ts`              | `FsError` 类、`isFsError`、`FsErrorKind`（14 种）、`FsErrorStatus`（`400 / 403 / 404 / 409 / 413 / 422 / 500 / 503`）                                                                                     |
 | `workspaceFileSystem.ts` | `createWorkspaceFileSystemFactory`、`WorkspaceFileSystem`、`WriteMode`、`ContentHash`、`FsEntry`、`FsStat`、`ListOptions`、`GlobOptions`、`ReadTextOptions`、`ReadBytesOptions`、`WriteTextAtomicOptions` |
 
 ### `FsErrorKind` 分类

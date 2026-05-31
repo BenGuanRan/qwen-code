@@ -151,16 +151,16 @@ flowchart TB
 sequenceDiagram
     autonumber
     participant C as Client (SDK)
-    participant MW as Middleware<br/>(bearer→host→CORS→mutationGate)
+    participant MW as Middleware<br/>(CORS→host→bearer→mutationGate)
     participant R as Route handler
     participant BR as AcpBridge
     participant BC as BridgeClient
     participant CH as ACP child
 
     C->>MW: POST /session/:id/prompt<br/>Authorization: Bearer …<br/>X-Qwen-Client-Id: …
-    MW->>MW: bearerAuth (constant-time compare)
-    MW->>MW: hostAllowlist (DNS rebinding guard)
     MW->>MW: denyBrowserOriginCors
+    MW->>MW: hostAllowlist (DNS rebinding guard)
+    MW->>MW: bearerAuth (constant-time compare)
     MW->>MW: mutationGate (strict on mutating routes)
     MW->>R: req validated
     R->>BR: bridge.sendPrompt(sessionId, body, clientId)
@@ -198,7 +198,7 @@ sequenceDiagram
 
 要点：
 
-- 环形缓冲有上限（`eventRingSize`，默认 1024）。
+- 环形缓冲有上限（`eventRingSize`，默认 8000）。
 - 重连客户端如果 `Last-Event-ID` 已经落出环外，会收到合成 catch-up 信号，必须用 `loadSession` / `resumeSession` 重建更深层状态。
 - 慢消费者在队列 75% 触发 `slow_client_warning`，达到上限时收到 `client_evicted`（终态）后被关掉。
 
@@ -358,7 +358,7 @@ sequenceDiagram
 | Workspace 文件系统 | `packages/cli/src/serve/fs/`                                         |
 | SDK DaemonClient   | `packages/sdk-typescript/src/daemon/DaemonClient.ts` (209-1506)      |
 | SDK SessionClient  | `packages/sdk-typescript/src/daemon/DaemonSessionClient.ts` (61-385) |
-| 事件 schema        | `packages/sdk-typescript/src/daemon/events.ts` (13-63)               |
+| 事件 schema        | `packages/sdk-typescript/src/daemon/events.ts` (14-112)              |
 
 ## 参考
 

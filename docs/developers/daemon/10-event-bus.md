@@ -1,7 +1,7 @@
 # SSE 事件总线与反压
 ## 概览
 
-`EventBus`（`packages/acp-bridge/src/eventBus.ts`）是每 session 一份的内存 pub/sub，喂给 daemon 的 `GET /session/:id/events` SSE 路由。它给每个事件分配单调 id、用有界环形缓冲缓存最近事件给 `Last-Event-ID` 重放、把 publish 扇出到所有订阅者、对订阅者实施反压（队列 75% 满时发警告、达到上限时驱逐），还会合成两种终态帧（`client_evicted`、`slow_client_warning`），SDK 把它们当一等事件，但 bus 故意**不**给它们分配 `id`，防止它们占掉本 session 的序列号让其他订阅者看到断档。
+`EventBus`（`packages/acp-bridge/src/eventBus.ts`）是每 session 一份的内存 pub/sub，喂给 daemon 的 `GET /session/:id/events` SSE 路由。它给每个事件分配单调 id、用有界环形缓冲缓存最近事件给 `Last-Event-ID` 重放、把 publish 扇出到所有订阅者、对订阅者实施反压（队列 75% 满时发警告、达到上限时驱逐），还会合成终态帧 `client_evicted` 与警告帧 `slow_client_warning`（37.5% 滞回重臂，**非终态**、可重复发送），SDK 把它们当一等事件，但 bus 故意**不**给它们分配 `id`，防止它们占掉本 session 的序列号让其他订阅者看到断档。
 
 `EventBus` 目前是 `acp-bridge` 包内部的实现，bridge 工厂为每 session 闭包持有一份。未来 refactor（文件 line 150–159 提到）会把它升到顶层组件，channels、dual-output 以及未来 WebSocket 传输都能通过同一 bus 订阅，而不必各跑一条并行流。
 
@@ -34,7 +34,7 @@
 interface BridgeEvent {
   id?: number; // per session 单调；合成终态帧无 id
   v: 1; // EVENT_SCHEMA_VERSION
-  type: string; // 29 已知 type 之一或未来扩展
+  type: string; // 38 已知 type 之一或未来扩展
   data: unknown; // payload，SDK 按 type typed（详见 09）
   originatorClientId?: string; // 由带 clientId 的请求派生
 }
@@ -70,16 +70,16 @@ flowchart TD
     P["publish({type, data, originatorClientId?})"] --> C{"bus closed?"}
     C -->|yes| RU["return undefined"]
     C -->|no| AID["assign id = nextId++, v = 1"]
-    AID --> PR["push to ring (shift if &gt; ringSize)"]
+    AID --> PR["push to ring (shift if > ringSize)"]
     PR --> FAN["snapshot subscribers, for each sub:"]
     FAN --> EVCK{"sub.evicted?"}
     EVCK -->|yes| NEXT[next subscriber]
     EVCK -->|no| PUSH["sub.queue.push(event)"]
     PUSH --> OK{"accepted?"}
     OK -->|no| EVICT["mark evicted; force-push client_evicted; queue.close; sub.dispose"]
-    OK -->|yes| WARN{"!warned && liveSize &gt;= warnThreshold?"}
+    OK -->|yes| WARN{"!warned && liveSize >= warnThreshold?"}
     WARN -->|yes| FW["force-push slow_client_warning; warned = true"]
-    WARN -->|no| RES{"warned && liveSize &lt;= warnResetThreshold?"}
+    WARN -->|no| RES{"warned && liveSize <= warnResetThreshold?"}
     RES -->|yes| RA["warned = false (hysteresis re-arm)"]
     RES -->|no| NEXT
 ```
