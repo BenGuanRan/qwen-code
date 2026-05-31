@@ -2756,9 +2756,9 @@ export function createHttpAcpBridge(opts: BridgeOptions): HttpAcpBridge {
         v: EVENT_SCHEMA_VERSION,
         type: 'session_snapshot',
         data: {
-          sessionId: entry!.sessionId,
-          currentModelId: entry!.currentModelId ?? null,
-          currentApprovalMode: entry!.currentApprovalMode ?? null,
+          sessionId: entry.sessionId,
+          currentModelId: entry.currentModelId ?? null,
+          currentApprovalMode: entry.currentApprovalMode ?? null,
         },
       });
       async function* withSnapshot(): AsyncIterable<BridgeEvent> {

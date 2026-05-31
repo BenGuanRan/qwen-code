@@ -20,6 +20,9 @@ import esbuild from 'esbuild';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const rootDir = join(__dirname, '..');
+// Bumped from 100 KiB → 105 KiB: the A5 session_snapshot type,
+// validator (isSessionSnapshotData), reducer case, and
+// RESYNC_PASSTHROUGH_TYPES entry add ~1.2 KiB of justified payload.
 const MAX_DAEMON_BROWSER_BUNDLE_BYTES = 105 * 1024;
 
 rmSync(join(rootDir, 'dist'), { recursive: true, force: true });
