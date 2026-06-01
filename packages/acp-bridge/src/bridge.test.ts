@@ -9634,6 +9634,7 @@ describe('createHttpAcpBridge — side-channel state layer (#4511)', () => {
       // broadcasting an invalid approval_mode_changed. We trigger the
       // approvalMode reconcile via setSessionApprovalMode (not via
       // modelServiceId, which only reconciles the model branch).
+      let statusReads = 0;
       const factory: ChannelFactory = async () => {
         const { clientStream, agentStream } = createInMemoryChannel();
         const fakeAgent = new FakeAgent({
@@ -9645,6 +9646,7 @@ describe('createHttpAcpBridge — side-channel state layer (#4511)', () => {
               });
             }
             if (method === 'qwen/status/session/context') {
+              statusReads += 1;
               // Agent claims a mode that's NOT in KNOWN_APPROVAL_MODES.
               return Promise.resolve({
                 state: { modes: { currentModeId: 'super-yolo' } },
@@ -9691,6 +9693,10 @@ describe('createHttpAcpBridge — side-channel state layer (#4511)', () => {
 
       // Wait for reconcile to fire (async microtask chain).
       await new Promise((r) => setTimeout(r, 50));
+      // Positive assertion: reconcile DID execute (status was read).
+      // Without this, a future refactor that disables reconcile would
+      // make the modeEvents assertion pass vacuously.
+      expect(statusReads).toBe(1);
       // Only the original mode change should appear — no corrective
       // for the unknown 'super-yolo' value from the agent.
       expect(modeEvents).toEqual(['yolo']);
