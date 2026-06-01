@@ -963,7 +963,13 @@ export const BackgroundTasksDialog: React.FC<BackgroundTasksDialogProps> = ({
         ? selectedEntry.monitorId
         : undefined;
   useEffect(() => {
-    if (!dialogOpen || dialogMode !== 'detail' || !selectedLiveEntityId) return;
+    // `isDetailMode` covers both `dialogMode === 'detail'` (entered from
+    // the list) and `dialogMode === 'detail-from-panel'` (entered from
+    // the LiveAgentPanel). The detail body renders in both modes and
+    // every sibling effect (below) uses the same predicate; narrowing
+    // to just `'detail'` would silently drop live-refresh on the
+    // panel-entered path.
+    if (!dialogOpen || !isDetailMode || !selectedLiveEntityId) return;
     const registry = config.getTaskRegistry();
     return registry.subscribe((entry) => {
       if (!entry) return;
@@ -976,7 +982,7 @@ export const BackgroundTasksDialog: React.FC<BackgroundTasksDialogProps> = ({
       if (id !== selectedLiveEntityId) return;
       setActivityTick((n) => n + 1);
     });
-  }, [dialogOpen, dialogMode, config, selectedLiveEntityId]);
+  }, [dialogOpen, isDetailMode, config, selectedLiveEntityId]);
 
   // Wall-clock tick for the running agent's duration. Activity callbacks
   // fire when tools run, but duration needs to advance even when the agent
