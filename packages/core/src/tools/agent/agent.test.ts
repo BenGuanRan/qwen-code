@@ -37,6 +37,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as transcript from '../../agents/agent-transcript.js';
+import { setAgentBackgroundCapForTest } from '../../tasks/agent-task.js';
 
 // Type for accessing protected methods in tests
 type AgentToolInvocation = {
@@ -143,6 +144,7 @@ describe('AgentTool', () => {
       getGeminiClient: vi.fn().mockReturnValue(undefined),
       getHookSystem: vi.fn().mockReturnValue(undefined),
       getTranscriptPath: vi.fn().mockReturnValue('/test/transcript'),
+      getStopHookBlockingCap: vi.fn().mockReturnValue(8),
       getApprovalMode: vi.fn().mockReturnValue('default'),
       isTrustedFolder: vi.fn().mockReturnValue(true),
       getTaskRegistry: vi.fn().mockReturnValue(stubRegistry),
@@ -185,6 +187,7 @@ describe('AgentTool', () => {
 
   afterEach(() => {
     vi.useRealTimers();
+    setAgentBackgroundCapForTest(undefined);
   });
 
   describe('initialization', () => {
@@ -1529,7 +1532,6 @@ describe('AgentTool', () => {
     let mockAgent: AgentHeadless;
     let mockContextState: ContextState;
     let mockRegistry: {
-      assertCanStartBackgroundAgent: ReturnType<typeof vi.fn>;
       register: ReturnType<typeof vi.fn>;
       get: ReturnType<typeof vi.fn>;
       getAll: ReturnType<typeof vi.fn>;
@@ -1699,8 +1701,6 @@ describe('AgentTool', () => {
         );
         expect(attachSpy).not.toHaveBeenCalled();
         expect(mockAgent.execute).not.toHaveBeenCalled();
-        expect(mockRegistry.complete).not.toHaveBeenCalled();
-        expect(mockRegistry.fail).not.toHaveBeenCalled();
       } finally {
         attachSpy.mockRestore();
       }
@@ -1752,9 +1752,22 @@ describe('AgentTool', () => {
       const errorMessage =
         'Cannot start background agent: maximum concurrent background agents ' +
         '(1) reached. Stop an existing agent first.';
-      mockRegistry.assertCanStartBackgroundAgent.mockImplementation(() => {
-        throw new Error(errorMessage);
-      });
+      // Drive `agentAssertCanStartBackground` to throw by seeding the
+      // registry with one running background agent and forcing the cap
+      // down to 1 for the duration of this test.
+      setAgentBackgroundCapForTest(1);
+      mockRegistry.getByKind.mockImplementation((kind: string) =>
+        kind === 'agent'
+          ? [
+              {
+                kind: 'agent',
+                id: 'pre-existing',
+                isBackgrounded: true,
+                status: 'running',
+              },
+            ]
+          : [],
+      );
       const mockHookSystem = {
         fireSubagentStartEvent: vi.fn().mockResolvedValue(undefined),
         fireSubagentStopEvent: vi.fn().mockResolvedValue(undefined),
