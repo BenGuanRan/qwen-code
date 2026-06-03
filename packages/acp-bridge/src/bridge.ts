@@ -1127,6 +1127,8 @@ export function createHttpAcpBridge(opts: BridgeOptions): HttpAcpBridge {
         // but daemon stays up) still logs — there's no upstream
         // context line in that flow, and the message confirms the
         // cleanup actually ran.
+        const channelExitExpected = shuttingDown;
+        telemetry.metrics?.channelLifecycle('exit', channelExitExpected);
         if (!shuttingDown) {
           telemetry.event('channel.exited', {
             'qwen-code.daemon.channel.exit_code': exitInfo?.exitCode ?? -1,
@@ -1158,6 +1160,7 @@ export function createHttpAcpBridge(opts: BridgeOptions): HttpAcpBridge {
             /* bus already closed */
           }
           byId.delete(sid);
+          telemetry.metrics?.sessionLifecycle('die');
           // PR 14b fix (codex round 5): tombstone the id so any
           // late `extNotification` from the dying child can't leak
           // into the early-event buffer for a future load/resume of
@@ -1225,6 +1228,7 @@ export function createHttpAcpBridge(opts: BridgeOptions): HttpAcpBridge {
       // never returns a still-handshaking channel to a concurrent
       // caller.
       channelInfo = info;
+      telemetry.metrics?.channelLifecycle('spawn');
       return info;
     })();
 
@@ -1711,6 +1715,7 @@ export function createHttpAcpBridge(opts: BridgeOptions): HttpAcpBridge {
     };
     ci.sessionIds.add(entry.sessionId);
     byId.set(entry.sessionId, entry);
+    telemetry.metrics?.sessionLifecycle('spawn');
     // PR 14b fix #1 (codex review round 1): drain any guardrail
     // events that fired during this session's `newSession` handler
     // (before this entry registered) onto the freshly-created
@@ -2267,15 +2272,17 @@ export function createHttpAcpBridge(opts: BridgeOptions): HttpAcpBridge {
       // sent a stale id in the body would otherwise be dispatched to the
       // wrong agent process.
       const result = entry.promptQueue.then(() =>
-        telemetry.runWithContext(
-          capturedContext,
-          async () =>
-            await telemetry.withSpan(
+        telemetry.runWithContext(capturedContext, async () => {
+          const queueWaitMs = Date.now() - queuedAt;
+          telemetry.metrics?.promptQueueWait(queueWaitMs);
+          const dispatchStartMs = Date.now();
+          try {
+            return await telemetry.withSpan(
               'prompt.dispatch',
               {
                 'qwen-code.daemon.bridge.operation': 'prompt.dispatch',
                 'session.id': sessionId,
-                'qwen-code.daemon.prompt.queue_wait_ms': Date.now() - queuedAt,
+                'qwen-code.daemon.prompt.queue_wait_ms': queueWaitMs,
                 ...(context?.clientId
                   ? { 'qwen-code.client_id': context.clientId }
                   : {}),
@@ -2399,8 +2406,11 @@ export function createHttpAcpBridge(opts: BridgeOptions): HttpAcpBridge {
                 }
                 return racedPromise;
               },
-            ),
-        ),
+            );
+          } finally {
+            telemetry.metrics?.promptDuration(Date.now() - dispatchStartMs);
+          }
+        }),
       );
       const promptId = context?.promptId;
       result.then(
@@ -2490,6 +2500,7 @@ export function createHttpAcpBridge(opts: BridgeOptions): HttpAcpBridge {
       const notif: CancelNotification = req
         ? { ...req, sessionId }
         : { sessionId };
+      telemetry.metrics?.cancelled();
       await telemetry.withSpan(
         'session.cancel',
         {
@@ -2752,6 +2763,7 @@ export function createHttpAcpBridge(opts: BridgeOptions): HttpAcpBridge {
       permissionMediator.forgetSession(sessionId);
       entry.pendingPermissionIds.clear();
       byId.delete(sessionId);
+      telemetry.metrics?.sessionLifecycle('close');
       // PR 14b fix (codex round 5): tombstone the closed sessionId
       // so any late `extNotification` from the (now-defunct) child
       // can't seed the early-event buffer and leak into a future
@@ -4367,6 +4379,7 @@ export function createHttpAcpBridge(opts: BridgeOptions): HttpAcpBridge {
       // can't reattach to a session we're tearing down.
       if (defaultEntry === entry) defaultEntry = undefined;
       byId.delete(sessionId);
+      telemetry.metrics?.sessionLifecycle('die');
       // Detach from the channel. The channel dies only when its LAST
       // session leaves — other sessions on the same channel keep
       // running.
