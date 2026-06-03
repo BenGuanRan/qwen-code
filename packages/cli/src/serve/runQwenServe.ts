@@ -126,8 +126,8 @@ function createDaemonTelemetryRuntimeConfig(
     getTelemetryIncludeSensitiveSpanAttributes: () =>
       telemetry.includeSensitiveSpanAttributes ?? false,
     getTelemetryResourceAttributes: () => ({
-      ...(telemetry.resourceAttributes ?? {}),
       'service.instance.id': daemonSessionId,
+      ...(telemetry.resourceAttributes ?? {}),
     }),
     getTelemetryMetricsIncludeSessionId: () =>
       telemetry.metrics?.includeSessionId ?? false,
@@ -753,7 +753,11 @@ export async function runQwenServe(
         action === 'spawn'
           ? 'ACP channel spawned.'
           : `ACP channel exited (expected=${expected}).`,
-        { 'qwen-code.daemon.channel.expected': expected ?? true },
+        {
+          ...(action === 'exit'
+            ? { 'qwen-code.daemon.channel.expected': expected ?? true }
+            : {}),
+        },
         {
           eventName: `qwen-code.daemon.channel.${action}`,
           ...(!expected && action === 'exit' ? { severityNumber: 13 } : {}),
