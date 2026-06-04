@@ -1218,6 +1218,12 @@ export async function runQwenServe(
       server.on('error', (err) => {
         daemonLog.error('server error', err instanceof Error ? err : null);
       });
+      // Enable WebSocket transport now that the http.Server is available.
+      const acpHandle = app.locals?.['acpHandle'] as
+        | { attachServer?: (s: typeof server) => void }
+        | undefined;
+      acpHandle?.attachServer?.(server);
+
       resolve(handle);
     });
     server.once('error', reject);
