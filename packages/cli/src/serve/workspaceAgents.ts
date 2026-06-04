@@ -18,7 +18,10 @@ import {
 } from '@qwen-code/qwen-code-core';
 import { writeStderrLine } from '../utils/stdioHelpers.js';
 import { isServeDebugMode } from './debugMode.js';
-import { InvalidClientIdError, type AcpSessionBridge } from './acpSessionBridge.js';
+import {
+  InvalidClientIdError,
+  type AcpSessionBridge,
+} from './acpSessionBridge.js';
 
 /**
  * Pattern for the route-layer `:agentType` URL parameter. Matches the
@@ -1267,7 +1270,7 @@ function sanitizeRunConfig(
   return out as SubagentConfig['runConfig'];
 }
 
-function toSummary(config: SubagentConfig): ServeWorkspaceAgentSummary {
+export function toSummary(config: SubagentConfig): ServeWorkspaceAgentSummary {
   const summary: ServeWorkspaceAgentSummary = {
     kind: 'agent',
     name: config.name,
@@ -1285,7 +1288,7 @@ function toSummary(config: SubagentConfig): ServeWorkspaceAgentSummary {
   return summary;
 }
 
-function toDetail(config: SubagentConfig): ServeWorkspaceAgentDetail {
+export function toDetail(config: SubagentConfig): ServeWorkspaceAgentDetail {
   const detail: ServeWorkspaceAgentDetail = {
     ...toSummary(config),
     systemPrompt: config.systemPrompt,

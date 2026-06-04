@@ -10,7 +10,9 @@ import {
   type ApprovalMode,
   BTW_MAX_INPUT_LENGTH,
   SessionService,
+  SubagentError,
   WorkspaceMemoryFileTooLargeError,
+  type SubagentLevel,
   WorkspaceMemoryWriteTimeoutError,
   writeWorkspaceContextFile,
 } from '@qwen-code/qwen-code-core';
@@ -27,6 +29,11 @@ import { MAX_WORKSPACE_PATH_LENGTH } from '../fs/paths.js';
 import type { WorkspaceFileSystemFactory } from '../fs/index.js';
 import type { DeviceFlowRegistry } from '../auth/deviceFlow.js';
 import { collectWorkspaceMemoryStatus } from '../workspaceMemory.js';
+import {
+  createDaemonSubagentManager,
+  toSummary as agentToSummary,
+  toDetail as agentToDetail,
+} from '../workspaceAgents.js';
 import type {
   DaemonWorkspaceService,
   WorkspaceRequestContext,
@@ -108,6 +115,12 @@ const CONN_ROUTED_METHODS = new Set<string>([
   `${QWEN_METHOD_NS}workspace/mcp/servers/add`,
   `${QWEN_METHOD_NS}workspace/mcp/servers/remove`,
   `${QWEN_METHOD_NS}sessions/delete`,
+  // Wave 2: agents
+  `${QWEN_METHOD_NS}workspace/agents/list`,
+  `${QWEN_METHOD_NS}workspace/agents/get`,
+  `${QWEN_METHOD_NS}workspace/agents/create`,
+  `${QWEN_METHOD_NS}workspace/agents/update`,
+  `${QWEN_METHOD_NS}workspace/agents/delete`,
 ]);
 
 // SYNC: server.ts MAX_TOOL_NAME_LENGTH / MAX_SERVER_NAME_LENGTH (both 256).
@@ -181,6 +194,9 @@ function toRpcError(err: unknown): {
   data?: Record<string, unknown>;
 } {
   if (err instanceof AcpParamError) {
+    return { code: RPC.INVALID_PARAMS, message: err.message };
+  }
+  if (err instanceof SubagentError) {
     return { code: RPC.INVALID_PARAMS, message: err.message };
   }
   if (err instanceof FsError) {
@@ -257,13 +273,17 @@ export const ACP_PROTOCOL_VERSION = 1;
  * session stream (see the design doc §4 translation table).
  */
 export class AcpDispatcher {
+  private readonly agentManager;
+
   constructor(
     private readonly bridge: HttpAcpBridge,
     private readonly boundWorkspace: string,
     private readonly workspace: DaemonWorkspaceService,
     private readonly fsFactory?: WorkspaceFileSystemFactory,
     private readonly deviceFlowRegistry?: DeviceFlowRegistry,
-  ) {}
+  ) {
+    this.agentManager = createDaemonSubagentManager(boundWorkspace);
+  }
 
   /**
    * Build the `WorkspaceRequestContext` for workspace-scoped operations
@@ -398,10 +418,19 @@ export class AcpDispatcher {
             connectionId,
             workspaceCwd: this.boundWorkspace,
             methods: [
+              // session
               `${QWEN_METHOD_NS}session/heartbeat`,
               `${QWEN_METHOD_NS}session/context`,
               `${QWEN_METHOD_NS}session/supported_commands`,
               `${QWEN_METHOD_NS}session/update_metadata`,
+              `${QWEN_METHOD_NS}session/recap`,
+              `${QWEN_METHOD_NS}session/btw`,
+              `${QWEN_METHOD_NS}session/shell`,
+              `${QWEN_METHOD_NS}session/detach`,
+              `${QWEN_METHOD_NS}session/context_usage`,
+              `${QWEN_METHOD_NS}session/tasks`,
+              `${QWEN_METHOD_NS}sessions/delete`,
+              // workspace
               `${QWEN_METHOD_NS}workspace/mcp`,
               `${QWEN_METHOD_NS}workspace/skills`,
               `${QWEN_METHOD_NS}workspace/providers`,
@@ -410,6 +439,32 @@ export class AcpDispatcher {
               `${QWEN_METHOD_NS}workspace/init`,
               `${QWEN_METHOD_NS}workspace/set_tool_enabled`,
               `${QWEN_METHOD_NS}workspace/restart_mcp_server`,
+              `${QWEN_METHOD_NS}workspace/tools`,
+              `${QWEN_METHOD_NS}workspace/mcp/tools`,
+              `${QWEN_METHOD_NS}workspace/mcp/servers/add`,
+              `${QWEN_METHOD_NS}workspace/mcp/servers/remove`,
+              // memory
+              `${QWEN_METHOD_NS}workspace/memory`,
+              `${QWEN_METHOD_NS}workspace/memory/write`,
+              // files
+              `${QWEN_METHOD_NS}file/read`,
+              `${QWEN_METHOD_NS}file/read_bytes`,
+              `${QWEN_METHOD_NS}file/stat`,
+              `${QWEN_METHOD_NS}file/list`,
+              `${QWEN_METHOD_NS}file/glob`,
+              `${QWEN_METHOD_NS}file/write`,
+              `${QWEN_METHOD_NS}file/edit`,
+              // auth
+              `${QWEN_METHOD_NS}workspace/auth/status`,
+              `${QWEN_METHOD_NS}workspace/auth/device_flow/start`,
+              `${QWEN_METHOD_NS}workspace/auth/device_flow/get`,
+              `${QWEN_METHOD_NS}workspace/auth/device_flow/cancel`,
+              // agents
+              `${QWEN_METHOD_NS}workspace/agents/list`,
+              `${QWEN_METHOD_NS}workspace/agents/get`,
+              `${QWEN_METHOD_NS}workspace/agents/create`,
+              `${QWEN_METHOD_NS}workspace/agents/update`,
+              `${QWEN_METHOD_NS}workspace/agents/delete`,
             ],
           },
         },
@@ -1635,6 +1690,189 @@ export class AcpDispatcher {
             deleted: removeResult.removed,
             notFound: removeResult.notFound,
           } as unknown);
+          return;
+        }
+
+        // ── Wave 2: Workspace Agents CRUD ───────────────────────────
+
+        case `${QWEN_METHOD_NS}workspace/agents/list`: {
+          const agents = await this.agentManager.listSubagents({ force: true });
+          this.replyConn(conn, id, {
+            v: 1,
+            workspaceCwd: this.boundWorkspace,
+            agents: agents.map(agentToSummary),
+          });
+          return;
+        }
+
+        case `${QWEN_METHOD_NS}workspace/agents/get`: {
+          const agentType = String(params['agentType'] ?? '');
+          if (!agentType) {
+            if (id !== undefined)
+              conn.sendConn(
+                error(id, RPC.INVALID_PARAMS, '`agentType` is required'),
+              );
+            return;
+          }
+          const config = await this.agentManager.loadSubagent(agentType);
+          if (!config) {
+            if (id !== undefined)
+              conn.sendConn(
+                error(id, RPC.INVALID_PARAMS, `Agent "${agentType}" not found`),
+              );
+            return;
+          }
+          this.replyConn(conn, id, agentToDetail(config) as unknown);
+          return;
+        }
+
+        case `${QWEN_METHOD_NS}workspace/agents/create`: {
+          const scope = params['scope'];
+          if (scope !== 'workspace' && scope !== 'global') {
+            if (id !== undefined)
+              conn.sendConn(
+                error(
+                  id,
+                  RPC.INVALID_PARAMS,
+                  '`scope` must be "workspace" or "global"',
+                ),
+              );
+            return;
+          }
+          const name = params['name'];
+          if (typeof name !== 'string' || !name.trim()) {
+            if (id !== undefined)
+              conn.sendConn(
+                error(id, RPC.INVALID_PARAMS, '`name` is required'),
+              );
+            return;
+          }
+          const level: SubagentLevel =
+            scope === 'workspace' ? 'project' : 'user';
+          const collision = await this.agentManager.loadSubagent(name, level);
+          if (collision) {
+            if (id !== undefined)
+              conn.sendConn(
+                error(
+                  id,
+                  RPC.INVALID_PARAMS,
+                  `Agent "${name}" already exists at ${level} level`,
+                ),
+              );
+            return;
+          }
+          const agentConfig = {
+            name,
+            description:
+              typeof params['description'] === 'string'
+                ? params['description']
+                : undefined,
+            systemPrompt:
+              typeof params['systemPrompt'] === 'string'
+                ? params['systemPrompt']
+                : '',
+            tools: Array.isArray(params['tools'])
+              ? (params['tools'] as string[])
+              : undefined,
+            model:
+              typeof params['model'] === 'string' ? params['model'] : undefined,
+          };
+          await this.agentManager.createSubagent(agentConfig, { level });
+          const created = await this.agentManager.loadSubagent(name, level);
+          this.bridge.publishWorkspaceEvent({
+            type: 'agent_changed',
+            data: { change: 'created', name, level },
+            originatorClientId: conn.clientId,
+          });
+          this.replyConn(conn, id, {
+            ok: true,
+            agent: created ? agentToDetail(created) : null,
+          } as unknown);
+          return;
+        }
+
+        case `${QWEN_METHOD_NS}workspace/agents/update`: {
+          const agentType = String(params['agentType'] ?? '');
+          if (!agentType) {
+            if (id !== undefined)
+              conn.sendConn(
+                error(id, RPC.INVALID_PARAMS, '`agentType` is required'),
+              );
+            return;
+          }
+          const existing = await this.agentManager.loadSubagent(agentType);
+          if (!existing) {
+            if (id !== undefined)
+              conn.sendConn(
+                error(id, RPC.INVALID_PARAMS, `Agent "${agentType}" not found`),
+              );
+            return;
+          }
+          const updates: Record<string, unknown> = {};
+          if (typeof params['description'] === 'string')
+            updates['description'] = params['description'];
+          if (typeof params['systemPrompt'] === 'string')
+            updates['systemPrompt'] = params['systemPrompt'];
+          if (Array.isArray(params['tools']))
+            updates['tools'] = params['tools'];
+          if (typeof params['model'] === 'string')
+            updates['model'] = params['model'];
+          await this.agentManager.updateSubagent(
+            agentType,
+            updates,
+            existing.level,
+          );
+          const updated = await this.agentManager.loadSubagent(
+            agentType,
+            existing.level,
+          );
+          this.bridge.publishWorkspaceEvent({
+            type: 'agent_changed',
+            data: { change: 'updated', name: agentType, level: existing.level },
+            originatorClientId: conn.clientId,
+          });
+          this.replyConn(conn, id, {
+            ok: true,
+            agent: updated ? agentToDetail(updated) : null,
+          } as unknown);
+          return;
+        }
+
+        case `${QWEN_METHOD_NS}workspace/agents/delete`: {
+          const agentType = String(params['agentType'] ?? '');
+          if (!agentType) {
+            if (id !== undefined)
+              conn.sendConn(
+                error(id, RPC.INVALID_PARAMS, '`agentType` is required'),
+              );
+            return;
+          }
+          const scope =
+            typeof params['scope'] === 'string' ? params['scope'] : undefined;
+          const level: SubagentLevel | undefined =
+            scope === 'workspace'
+              ? 'project'
+              : scope === 'global'
+                ? 'user'
+                : undefined;
+          const existing = await this.agentManager.loadSubagent(
+            agentType,
+            level,
+          );
+          if (!existing) {
+            if (id !== undefined)
+              conn.sendConn(
+                error(id, RPC.INVALID_PARAMS, `Agent "${agentType}" not found`),
+              );
+            return;
+          }
+          await this.agentManager.deleteSubagent(agentType, existing.level);
+          this.bridge.publishWorkspaceEvent({
+            type: 'agent_changed',
+            data: { change: 'deleted', name: agentType, level: existing.level },
+            originatorClientId: conn.clientId,
+          });
+          this.replyConn(conn, id, { ok: true });
           return;
         }
 
