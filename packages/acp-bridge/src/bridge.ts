@@ -4508,10 +4508,7 @@ export function createHttpAcpBridge(opts: BridgeOptions): HttpAcpBridge {
 
     async preheat() {
       if (shuttingDown) return;
-      const ci = await ensureChannel();
-      if (ci.sessionIds.size === 0 && ci.pendingRestoreIds.size === 0) {
-        startIdleTimer(ci);
-      }
+      await ensureChannel();
     },
   };
 }
