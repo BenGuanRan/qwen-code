@@ -886,7 +886,6 @@ export async function runQwenServe(
     daemonLog,
     workspace: workspaceService,
     persistDisabledTools: persistDisabledToolsFn,
-    contextFilename: contextFilenameForInit ?? 'QWEN.md',
   });
   // Issue #4175 PR 21 — `createServeApp` parks the device-flow registry
   // on `app.locals` when it constructs (or accepts) one. Pull it back
