@@ -11,7 +11,10 @@
  * of `cli/src/serve/`. The factory implementation itself moves in PR 22b/3.
  */
 
-import type { ApprovalMode } from '@qwen-code/qwen-code-core';
+import type {
+  ApprovalMode,
+  DaemonBridgeTelemetryMetrics,
+} from '@qwen-code/qwen-code-core';
 import type { ChannelFactory } from './channel.js';
 import type { PermissionPolicy } from './permission.js';
 import type { PermissionAuditPublisher } from './permissionMediator.js';
@@ -97,13 +100,7 @@ export type BridgeTelemetryAttributes = Record<
   string | number | boolean
 >;
 
-export interface BridgeTelemetryMetrics {
-  sessionLifecycle(action: 'spawn' | 'close' | 'die'): void;
-  channelLifecycle(action: 'spawn' | 'exit', expected?: boolean): void;
-  promptQueueWait(durationMs: number): void;
-  promptDuration(durationMs: number): void;
-  cancelled(): void;
-}
+export type BridgeTelemetryMetrics = DaemonBridgeTelemetryMetrics;
 
 export interface BridgeTelemetry {
   captureContext(): unknown;
